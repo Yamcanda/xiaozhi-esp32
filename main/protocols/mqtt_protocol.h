@@ -41,6 +41,9 @@ private:
     EventGroupHandle_t event_group_handle_;
 
     std::string publish_topic_;
+    std::atomic<bool> awaiting_hello_{false};
+    std::atomic<bool> remote_goodbye_{false};
+    std::string retired_session_id_;
 
     mutable std::mutex channel_mutex_;
     std::mutex crypto_mutex_;

@@ -32,7 +32,7 @@ bool LiteAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms, srmod
     return true;
 }
 
-void LiteAudioEngine::Feed(std::vector<int16_t>&& data) {
+void LiteAudioEngine::Feed(std::vector<int16_t>&& data, uint32_t voice_policy) {
     {
         std::lock_guard<std::mutex> lock(wake_word_mutex_);
         if (wake_word_enabled_ && wake_word_) {
@@ -40,12 +40,13 @@ void LiteAudioEngine::Feed(std::vector<int16_t>&& data) {
         }
     }
     if (voice_processing_enabled_) {
-        OutputRawAudio(data);
+        OutputRawAudio(data, voice_policy);
     }
 }
 
-void LiteAudioEngine::EnableWakeWordDetection(bool enable) {
+void LiteAudioEngine::EnableWakeWordDetection(bool enable, uint32_t policy) {
     std::lock_guard<std::mutex> lock(wake_word_mutex_);
+    wake_word_policy_ = policy;
     if (!wake_word_) {
         wake_word_enabled_ = false;
         return;
@@ -59,7 +60,8 @@ void LiteAudioEngine::EnableWakeWordDetection(bool enable) {
     }
 }
 
-void LiteAudioEngine::EnableVoiceProcessing(bool enable) {
+void LiteAudioEngine::EnableVoiceProcessing(bool enable, uint32_t policy) {
+    voice_policy_.store(enable ? (policy | 1U) : (policy & ~1U));
     voice_processing_enabled_ = enable;
     if (!enable) {
         std::lock_guard<std::mutex> lock(output_mutex_);
@@ -99,11 +101,13 @@ size_t LiteAudioEngine::GetFeedSize() const {
     return frame_samples_;
 }
 
-void LiteAudioEngine::OnWakeWordDetected(std::function<void(const std::string& wake_word)> callback) {
+void LiteAudioEngine::OnWakeWordDetected(
+    std::function<void(const std::string& wake_word, uint32_t policy)> callback) {
     wake_word_detected_callback_ = std::move(callback);
 }
 
-void LiteAudioEngine::OnOutput(std::function<void(std::vector<int16_t>&& data)> callback) {
+void LiteAudioEngine::OnOutput(
+    std::function<void(std::vector<int16_t>&& data, uint32_t policy)> callback) {
     output_callback_ = std::move(callback);
 }
 
@@ -154,7 +158,9 @@ bool LiteAudioEngine::CreateWakeWordLocked() {
     wake_word->OnWakeWordDetected([this](const std::string& detected_wake_word) {
         wake_word_enabled_ = false;
         if (wake_word_detected_callback_) {
-            wake_word_detected_callback_(detected_wake_word);
+            // Feed and this synchronous callback hold wake_word_mutex_, so the
+            // token cannot be replaced by a concurrent enable until Feed returns.
+            wake_word_detected_callback_(detected_wake_word, wake_word_policy_);
         }
     });
     if (!wake_word->Initialize(codec_, models_list_)) {
@@ -165,12 +171,19 @@ bool LiteAudioEngine::CreateWakeWordLocked() {
     return true;
 }
 
-void LiteAudioEngine::OutputRawAudio(const std::vector<int16_t>& data) {
+void LiteAudioEngine::OutputRawAudio(const std::vector<int16_t>& data, uint32_t policy) {
     if (!output_callback_ || codec_ == nullptr) {
         return;
     }
 
     std::lock_guard<std::mutex> lock(output_mutex_);
+    if ((policy & 1U) == 0 || policy != voice_policy_.load()) {
+        return;
+    }
+    if (output_buffer_policy_ != policy) {
+        output_buffer_.clear();
+        output_buffer_policy_ = policy;
+    }
     const size_t channels = codec_->input_channels();
     if (channels <= 1) {
         output_buffer_.insert(output_buffer_.end(), data.begin(), data.end());
@@ -182,12 +195,12 @@ void LiteAudioEngine::OutputRawAudio(const std::vector<int16_t>& data) {
 
     while (output_buffer_.size() >= static_cast<size_t>(frame_samples_)) {
         if (output_buffer_.size() == static_cast<size_t>(frame_samples_)) {
-            output_callback_(std::move(output_buffer_));
+            output_callback_(std::move(output_buffer_), policy);
             output_buffer_.clear();
             output_buffer_.reserve(frame_samples_);
         } else {
             output_callback_(std::vector<int16_t>(
-                output_buffer_.begin(), output_buffer_.begin() + frame_samples_));
+                output_buffer_.begin(), output_buffer_.begin() + frame_samples_), policy);
             output_buffer_.erase(output_buffer_.begin(), output_buffer_.begin() + frame_samples_);
         }
     }

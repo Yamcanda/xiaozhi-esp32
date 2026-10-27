@@ -1,9 +1,11 @@
 #ifndef PROTOCOL_H
 #define PROTOCOL_H
 
+#include <atomic>
 #include <cJSON.h>
 #include <chrono>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -13,6 +15,8 @@ struct AudioStreamPacket {
     uint32_t timestamp = 0;
     uint32_t playback_id = 0;
     uint32_t media_position_ms = 0;
+    uint32_t conversation_policy = 1;  // Local provenance only, never serialized.
+    uint32_t channel_generation = 0;
     std::vector<uint8_t> payload;
 };
 
@@ -48,10 +52,28 @@ public:
     inline int server_frame_duration() const { return server_frame_duration_; }
     inline const std::string& session_id() const { return session_id_; }
 
+    uint32_t channel_generation() const { return channel_generation_.load(); }
+    void SetConversationPolicySource(const std::atomic<uint32_t>* source) {
+        conversation_policy_source_ = source;
+    }
+    void SetChannelClosing(bool closing) {
+        channel_callback_generation_->store(closing ? 0 : channel_generation_.load());
+        channel_closing_.store(closing);
+    }
+    bool IsChannelClosing() const { return channel_closing_.load(); }
+    // Explicit lifecycle gate for scheduled control reconnect work. Handshake
+    // traffic on the opening worker/receive task must remain available.
+    void SetChannelOpening(bool opening) { channel_opening_.store(opening); }
+    bool IsChannelOpening() const { return channel_opening_.load(); }
+    void RequireConversationSession() { require_conversation_session_.store(true); }
+    bool UsesConversationPolicy() const {
+        return require_conversation_session_.load() ||
+               (conversation_policy_source_ != nullptr && conversation_policy_source_->load() != 1);
+    }
     void OnIncomingAudio(std::function<void(std::unique_ptr<AudioStreamPacket> packet)> callback);
-    void OnIncomingJson(std::function<void(const cJSON* root)> callback);
-    void OnAudioChannelOpened(std::function<void()> callback);
-    void OnAudioChannelClosed(std::function<void()> callback);
+    void OnIncomingJson(std::function<void(const cJSON* root, uint32_t generation)> callback);
+    void OnAudioChannelOpened(std::function<void(uint32_t generation)> callback);
+    void OnAudioChannelClosed(std::function<void(uint32_t generation)> callback);
     void OnNetworkError(std::function<void(const std::string& message)> callback);
     void OnConnected(std::function<void()> callback);
     void OnDisconnected(std::function<void()> callback);
@@ -61,6 +83,12 @@ public:
     virtual void CloseAudioChannel(bool send_goodbye = true) = 0;
     virtual bool IsAudioChannelOpened() const = 0;
     virtual bool SendAudio(std::unique_ptr<AudioStreamPacket> packet) = 0;
+    // Maximum UTF-8 payload bytes before JSON escaping; shared by all transports.
+    static constexpr size_t kMaxTextInteractionBytes = 12 * 1024;
+    static bool IsTextRequestValid(const std::string& text);
+    // Uses the existing listen/detect wire contract. True means transport send
+    // accepted, not that the server will run an LLM or produce speech.
+    virtual bool SendTextRequest(const std::string& text);
     virtual void SendWakeWordDetected(const std::string& wake_word);
     virtual void SendStartListening(ListeningMode mode);
     virtual void SendStopListening();
@@ -68,10 +96,31 @@ public:
     virtual void SendMcpMessage(const std::string& message);
 
 protected:
-    std::function<void(const cJSON* root)> on_incoming_json_;
+    std::function<void(const cJSON* root, uint32_t generation)> on_incoming_json_;
     std::function<void(std::unique_ptr<AudioStreamPacket> packet)> on_incoming_audio_;
-    std::function<void()> on_audio_channel_opened_;
-    std::function<void()> on_audio_channel_closed_;
+    std::function<void(uint32_t generation)> on_audio_channel_opened_;
+    std::function<void(uint32_t generation)> on_audio_channel_closed_;
+    inline static std::atomic<uint32_t> next_channel_generation_{0};
+    std::atomic<uint32_t> channel_generation_{0};
+    // Queued transport work may outlive Protocol, but must not acquire socket
+    // ownership after main begins closing or after a different channel opens.
+    std::shared_ptr<std::atomic<uint32_t>> channel_callback_generation_ =
+        std::make_shared<std::atomic<uint32_t>>(0);
+    uint32_t BeginChannel() {
+        const auto generation = next_channel_generation_.fetch_add(1) + 1;
+        channel_generation_.store(generation);
+        channel_callback_generation_->store(generation);
+        return generation;
+    }
+    std::atomic<bool> channel_closing_{false};
+    std::atomic<bool> channel_opening_{false};
+    std::atomic<bool> require_conversation_session_{false};
+    const std::atomic<uint32_t>* conversation_policy_source_ = nullptr;
+    bool IsAudioPacketCurrent(const AudioStreamPacket& packet) const {
+        return !channel_closing_.load() && (conversation_policy_source_ == nullptr ||
+               ((packet.conversation_policy & 1U) != 0 &&
+                packet.conversation_policy == conversation_policy_source_->load()));
+    }
     std::function<void(const std::string& message)> on_network_error_;
     std::function<void()> on_connected_;
     std::function<void()> on_disconnected_;

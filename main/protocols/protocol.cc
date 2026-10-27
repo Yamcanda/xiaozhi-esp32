@@ -23,7 +23,8 @@ void Protocol::AddTextFontCapabilities(cJSON* root) {
     cJSON_AddItemToObject(root, "text_font", font);
 }
 
-void Protocol::OnIncomingJson(std::function<void(const cJSON* root)> callback) {
+void Protocol::OnIncomingJson(
+    std::function<void(const cJSON* root, uint32_t generation)> callback) {
     on_incoming_json_ = callback;
 }
 
@@ -32,11 +33,11 @@ void Protocol::OnIncomingAudio(
     on_incoming_audio_ = callback;
 }
 
-void Protocol::OnAudioChannelOpened(std::function<void()> callback) {
+void Protocol::OnAudioChannelOpened(std::function<void(uint32_t generation)> callback) {
     on_audio_channel_opened_ = callback;
 }
 
-void Protocol::OnAudioChannelClosed(std::function<void()> callback) {
+void Protocol::OnAudioChannelClosed(std::function<void(uint32_t generation)> callback) {
     on_audio_channel_closed_ = callback;
 }
 
@@ -72,14 +73,49 @@ void Protocol::SendAbortSpeaking(AbortReason reason) {
     SendText(message);
 }
 
-void Protocol::SendWakeWordDetected(const std::string& wake_word) {
-    std::string json = "{\"session_id\":\"" + session_id_ +
-                       "\",\"type\":\"listen\",\"state\":\"detect\",\"text\":\"" + wake_word +
-                       "\"}";
-    SendText(json);
+bool Protocol::IsTextRequestValid(const std::string& text) {
+    if (text.empty() || text.size() > kMaxTextInteractionBytes ||
+        text.find('\0') != std::string::npos) {
+        return false;
+    }
+    return text.find_first_not_of(" \t\r\n\f\v") != std::string::npos;
 }
 
+bool Protocol::SendTextRequest(const std::string& text) {
+    const auto policy = conversation_policy_source_ ? conversation_policy_source_->load() : 1U;
+    if (!IsTextRequestValid(text) || IsChannelClosing() || IsChannelOpening() || !(policy & 1U) ||
+        !IsAudioChannelOpened()) {
+        return false;
+    }
+    // This bounded allocation is on the interaction path, never per audio frame.
+    auto* root = cJSON_CreateObject();
+    if (root == nullptr) {
+        return false;
+    }
+    const bool complete = cJSON_AddStringToObject(root, "session_id", session_id_.c_str()) &&
+                          cJSON_AddStringToObject(root, "type", "listen") &&
+                          cJSON_AddStringToObject(root, "state", "detect") &&
+                          cJSON_AddStringToObject(root, "text", text.c_str());
+    auto* json = complete ? cJSON_PrintUnformatted(root) : nullptr;
+    cJSON_Delete(root);
+    if (json == nullptr) {
+        return false;
+    }
+    const std::string message(json);
+    cJSON_free(json);
+    // Encoding may have overlapped a complete foreground disable/enable cycle.
+    return !IsChannelClosing() &&
+           (!conversation_policy_source_ || conversation_policy_source_->load() == policy) &&
+           SendText(message);
+}
+
+void Protocol::SendWakeWordDetected(const std::string& wake_word) { SendTextRequest(wake_word); }
+
 void Protocol::SendStartListening(ListeningMode mode) {
+    if (IsChannelClosing() || (conversation_policy_source_ &&
+                              !(conversation_policy_source_->load() & 1U))) {
+        return;
+    }
     std::string message = "{\"session_id\":\"" + session_id_ + "\"";
     message += ",\"type\":\"listen\",\"state\":\"start\"";
     if (mode == kListeningModeRealtime) {
@@ -102,7 +138,11 @@ void Protocol::SendStopListening() {
 void Protocol::SendMcpMessage(const std::string& payload) {
     std::string message =
         "{\"session_id\":\"" + session_id_ + "\",\"type\":\"mcp\",\"payload\":" + payload + "}";
-    SendText(message);
+    if (SendText(message)) {
+        ESP_LOGI(TAG, "MCP transport send accepted");
+    } else {
+        ESP_LOGW(TAG, "MCP transport send failed");
+    }
 }
 
 bool Protocol::IsTimeout() const {

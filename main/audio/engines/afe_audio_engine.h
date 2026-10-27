@@ -26,10 +26,10 @@ public:
     ~AfeAudioEngine() override;
 
     bool Initialize(AudioCodec* codec, int frame_duration_ms, srmodel_list_t* models_list) override;
-    void Feed(std::vector<int16_t>&& data) override;
+    void Feed(std::vector<int16_t>&& data, uint32_t voice_policy = 1) override;
 
-    void EnableWakeWordDetection(bool enable) override;
-    void EnableVoiceProcessing(bool enable) override;
+    void EnableWakeWordDetection(bool enable, uint32_t policy = 1) override;
+    void EnableVoiceProcessing(bool enable, uint32_t policy = 1) override;
     void EnableDeviceAec(bool enable) override;
 
     bool HasWakeWord() const override;
@@ -39,8 +39,10 @@ public:
     std::vector<std::string> GetWakeWords() const override;
     size_t GetFeedSize() const override;
 
-    void OnWakeWordDetected(std::function<void(const std::string& wake_word)> callback) override;
-    void OnOutput(std::function<void(std::vector<int16_t>&& data)> callback) override;
+    void OnWakeWordDetected(
+        std::function<void(const std::string& wake_word, uint32_t policy)> callback) override;
+    void OnOutput(
+        std::function<void(std::vector<int16_t>&& data, uint32_t policy)> callback) override;
     void OnVadStateChange(std::function<void(bool speaking)> callback) override;
 
     void EncodeWakeWordData() override;
@@ -80,6 +82,9 @@ private:
     // Incremented whenever an active AFE session is invalidated. ProcessingTask
     // uses it to reject a fetch result produced before a disable/re-enable cycle.
     std::atomic<uint32_t> control_generation_{0};
+    // Odd values are armed; detection atomically claims its generation by clearing bit 0.
+    std::atomic<uint32_t> wake_word_policy_{0};
+    uint32_t processing_wake_word_policy_ = 1;  // Owned by ProcessingTask, including MultiNet Feed.
     WakeDetector wake_detector_ = WakeDetector::kNone;
 
     std::unique_ptr<CustomWakeWord> custom_wake_word_;
@@ -89,8 +94,11 @@ private:
     std::vector<int16_t> output_buffer_;
     std::mutex input_buffer_mutex_;
 
-    std::function<void(const std::string&)> wake_word_detected_callback_;
-    std::function<void(std::vector<int16_t>&&)> output_callback_;
+    std::function<void(const std::string&, uint32_t)> wake_word_detected_callback_;
+    std::function<void(std::vector<int16_t>&&, uint32_t)> output_callback_;
+    std::atomic<uint32_t> voice_policy_{1};
+    uint32_t processing_voice_policy_ = 0;
+    uint32_t output_buffer_policy_ = 0;
     std::function<void(bool)> vad_state_change_callback_;
 
     TaskHandle_t wake_word_encode_task_ = nullptr;
@@ -106,9 +114,10 @@ private:
     void UpdateAecState();
     void ApplyAfeControls();
     void ApplyPendingReset();
-    void OutputRawAudio(const std::vector<int16_t>& data);
-    void HandleWakeWordResult(const afe_fetch_result_t* result);
-    void HandleVoiceResult(const afe_fetch_result_t* result);
+    void OutputRawAudio(const std::vector<int16_t>& data, uint32_t policy);
+    bool ClaimWakeWordDetection(uint32_t policy);
+    void HandleWakeWordResult(const afe_fetch_result_t* result, uint32_t policy);
+    void HandleVoiceResult(const afe_fetch_result_t* result, uint32_t policy);
 };
 
 #endif

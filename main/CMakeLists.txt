@@ -1134,6 +1134,9 @@ if(CONFIG_IDF_TARGET_ESP32S3)
 endif()
 
 set(MAIN_PRIV_REQUIRES_EXTRA "")
+if(CONFIG_BOARD_TYPE_M5STACK_STOPWATCH AND CONFIG_STOPWATCH_LOCAL_APPS)
+    list(APPEND MAIN_PRIV_REQUIRES_EXTRA esp_http_server wear_levelling)
+endif()
 if(CONFIG_XIAOZHI_NETWORK_ETHERNET AND CONFIG_XIAOZHI_ETH_PHY_IP101)
     list(APPEND MAIN_PRIV_REQUIRES_EXTRA espressif__ip101)
 endif()
@@ -1193,6 +1196,21 @@ idf_component_register(SRCS ${SOURCES}
 # dialect; pin the baseline so main/ does not depend on it.
 if(NOT CMAKE_BUILD_EARLY_EXPANSION)
     target_compile_options(${COMPONENT_LIB} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-std=gnu++23>)
+endif()
+
+# Keep the default badges in the apps firmware, not in the shared assets partition.
+if(CONFIG_BOARD_TYPE_M5STACK_STOPWATCH AND CONFIG_STOPWATCH_LOCAL_APPS AND NOT CMAKE_BUILD_EARLY_EXPANSION)
+    set(STOPWATCH_BADGE_IMAGES
+        "${PROJECT_DIR}/image/01-status-dnd.jpg"
+        "${PROJECT_DIR}/image/02-status-focus.jpg"
+        "${PROJECT_DIR}/image/03-status-chill.jpg"
+        "${PROJECT_DIR}/image/04-pet-shiba.jpg"
+        "${PROJECT_DIR}/image/05-mars.jpg"
+        "${PROJECT_DIR}/image/06-earth.jpg"
+    )
+    foreach(BADGE_IMAGE IN LISTS STOPWATCH_BADGE_IMAGES)
+        target_add_binary_data(${COMPONENT_LIB} "${BADGE_IMAGE}" BINARY)
+    endforeach()
 endif()
 
 # Use target_compile_definitions to define the reported board identity

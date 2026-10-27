@@ -38,12 +38,14 @@
 #define DISPLAY_OFFSET_Y            0
 
 // Round screen UI layout (466x466)
-#define DISPLAY_ROUND_EDGE_INSET        56 // top/bottom arc safe zone
-#define DISPLAY_STATUS_BAR_TOP_OFF      56 // status text: upper half, below WiFi/battery icons
+#define DISPLAY_ROUND_EDGE_INSET        84 // horizontal inset at the status row's top arc
+#define DISPLAY_STATUS_BAR_TOP_OFF      56 // Wi-Fi, time/status and battery row
 #define DISPLAY_CHAT_BAR_BOTTOM_OFF     66 // subtitle: lifted from bottom arc
 
 // Touch (CST820B @ 0x15)
+#define TOUCH_I2C_ADDR              0x15
 #define TOUCH_INT_PIN               GPIO_NUM_13
+#define STOPWATCH_HOME_HOLD_MS      800
 
 // Buttons
 #define BUTTON1_GPIO                GPIO_NUM_2

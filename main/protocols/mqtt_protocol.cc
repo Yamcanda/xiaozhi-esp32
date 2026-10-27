@@ -22,15 +22,22 @@ MqttProtocol::MqttProtocol() {
             [](void* arg) {
                 MqttProtocol* protocol = (MqttProtocol*)arg;
                 auto& app = Application::GetInstance();
-                if (app.GetDeviceState() == kDeviceStateIdle) {
+                auto alive = protocol->alive_;
+                app.Schedule([protocol, alive]() {
+                    if (!*alive) {
+                        return;
+                    }
+                    if (protocol->IsChannelClosing() || protocol->IsChannelOpening() ||
+                        Application::GetInstance().GetDeviceState() != kDeviceStateIdle) {
+                        // Do not race a blocking audio open, or lose this one-shot
+                        // retry forever while a foreground session is busy.
+                        esp_timer_start_once(protocol->reconnect_timer_,
+                                             MQTT_RECONNECT_INTERVAL_MS * 1000);
+                        return;
+                    }
                     ESP_LOGI(TAG, "Reconnecting to MQTT server");
-                    auto alive = protocol->alive_;  // Capture alive flag
-                    app.Schedule([protocol, alive]() {
-                        if (*alive) {
-                            protocol->StartMqttClient(false);
-                        }
-                    });
-                }
+                    protocol->StartMqttClient(false);
+                });
             },
         .arg = this,
     };
@@ -72,6 +79,9 @@ MqttProtocol::~MqttProtocol() {
 bool MqttProtocol::Start() { return StartMqttClient(false); }
 
 bool MqttProtocol::StartMqttClient(bool report_error) {
+    if (IsChannelClosing()) {
+        return false;
+    }
     if (mqtt_ != nullptr) {
         ESP_LOGW(TAG, "Mqtt client already started");
         mqtt_.reset();
@@ -114,6 +124,10 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
     });
 
     mqtt_->OnMessage([this](const std::string& topic, const std::string& payload) {
+        if (IsChannelClosing()) {
+            return;
+        }
+        const auto generation = channel_generation_.load();
         cJSON* root = cJSON_Parse(payload.c_str());
         if (root == nullptr) {
             ESP_LOGE(TAG, "Failed to parse json message %s", payload.c_str());
@@ -127,22 +141,61 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
         }
 
         if (strcmp(type->valuestring, "hello") == 0) {
-            ParseServerHello(root);
+            if (awaiting_hello_.load()) {
+                auto session = cJSON_GetObjectItem(root, "session_id");
+                bool retired = false;
+                {
+                    std::lock_guard<std::mutex> lock(channel_mutex_);
+                    retired = UsesConversationPolicy() && cJSON_IsString(session) &&
+                              retired_session_id_ == session->valuestring;
+                }
+                if (!retired) {
+                    ParseServerHello(root);
+                }
+            }
         } else if (strcmp(type->valuestring, "goodbye") == 0) {
             auto session_id = cJSON_GetObjectItem(root, "session_id");
             ESP_LOGI(TAG, "Received goodbye message, session_id: %s",
                      cJSON_IsString(session_id) ? session_id->valuestring : "null");
-            if (cJSON_IsString(session_id) && session_id_ == session_id->valuestring) {
-                auto alive = alive_;  // Capture alive flag
-                Application::GetInstance().Schedule([this, alive]() {
-                    if (*alive) {
-                        // Server initiated goodbye, don't send goodbye back to avoid ping-pong
-                        CloseAudioChannel(false);
+            bool matching_session = false;
+            {
+                std::lock_guard<std::mutex> lock(channel_mutex_);
+                matching_session = cJSON_IsString(session_id) && session_id_ == session_id->valuestring;
+            }
+            if (matching_session) {
+                remote_goodbye_.store(true);
+                if (UsesConversationPolicy()) {
+                    if (on_audio_channel_closed_) {
+                        on_audio_channel_closed_(generation);
                     }
-                });
+                } else {
+                    auto alive = alive_;
+                    Application::GetInstance().Schedule([this, alive, generation]() {
+                        if (*alive && generation == channel_generation_.load() &&
+                            !IsChannelClosing() && !IsChannelOpening()) {
+                            CloseAudioChannel(false);
+                        }
+                    });
+                }
             }
         } else if (on_incoming_json_ != nullptr) {
-            on_incoming_json_(root);
+            auto session = cJSON_GetObjectItem(root, "session_id");
+            bool current = true;
+            {
+                std::lock_guard<std::mutex> lock(channel_mutex_);
+                if (UsesConversationPolicy() &&
+                    (strcmp(type->valuestring, "tts") == 0 ||
+                     strcmp(type->valuestring, "stt") == 0 ||
+                     strcmp(type->valuestring, "llm") == 0)) {
+                    // MQTT stays subscribed after UDP closes: a sessionless
+                    // conversational message cannot prove it belongs to this turn.
+                    current = !session_id_.empty() && cJSON_IsString(session) &&
+                              session_id_ == session->valuestring && !awaiting_hello_.load();
+                }
+            }
+            if (current) {
+                on_incoming_json_(root, generation);
+            }
         }
         cJSON_Delete(root);
         last_incoming_time_ = std::chrono::steady_clock::now();
@@ -190,7 +243,7 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
 }
 
 bool MqttProtocol::SendText(const std::string& text) {
-    if (publish_topic_.empty()) {
+    if (IsChannelClosing() || mqtt_ == nullptr || publish_topic_.empty()) {
         return false;
     }
     if (!mqtt_->Publish(publish_topic_, text)) {
@@ -203,6 +256,10 @@ bool MqttProtocol::SendText(const std::string& text) {
 
 bool MqttProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
     constexpr size_t kAudioHeaderSize = 16;
+    if (!packet || !IsAudioPacketCurrent(*packet)) {
+        return false;
+    }
+    const auto generation = channel_generation_.load();
 
     // Keep the critical section short: only snapshot the channel state here.
     // udp->Send() below may block waiting for the modem, and the UDP receive
@@ -243,14 +300,20 @@ bool MqttProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
     }
 
     // Send without holding channel_mutex_ (see above).
-    return udp->Send(encrypted) > 0;
+    return generation == channel_generation_.load() && IsAudioPacketCurrent(*packet) &&
+           udp->Send(encrypted) > 0;
 }
 
 void MqttProtocol::CloseAudioChannel(bool send_goodbye) {
+    const auto generation = channel_generation_.load();
+    send_goodbye = send_goodbye && !remote_goodbye_.exchange(false);
+    awaiting_hello_.store(false);
+    std::string session;
     std::shared_ptr<Udp> udp;
     {
         std::lock_guard<std::mutex> lock(channel_mutex_);
         udp = std::move(udp_);
+        session = session_id_;
     }
     udp.reset();
 
@@ -260,18 +323,26 @@ void MqttProtocol::CloseAudioChannel(bool send_goodbye) {
     // Don't send if server already sent goodbye (to avoid ping-pong)
     if (send_goodbye) {
         std::string message = "{";
-        message += "\"session_id\":\"" + session_id_ + "\",";
+        message += "\"session_id\":\"" + session + "\",";
         message += "\"type\":\"goodbye\"";
         message += "}";
-        SendText(message);
+        // Close owns the serialized channel; ordinary SendText is gated while
+        // teardown runs, but this final goodbye is part of that teardown.
+        if (mqtt_ && !publish_topic_.empty()) {
+            mqtt_->Publish(publish_topic_, message);
+        }
     }
 
     if (on_audio_channel_closed_ != nullptr) {
-        on_audio_channel_closed_();
+        on_audio_channel_closed_(generation);
     }
 }
 
 bool MqttProtocol::OpenAudioChannel() {
+    if (IsChannelClosing()) {
+        return false;
+    }
+    const auto generation = BeginChannel();
     if (mqtt_ == nullptr || !mqtt_->IsConnected()) {
         ESP_LOGI(TAG, "MQTT is not connected, try to connect now");
         if (!StartMqttClient(true)) {
@@ -280,7 +351,13 @@ bool MqttProtocol::OpenAudioChannel() {
     }
 
     error_occurred_ = false;
-    session_id_ = "";
+    {
+        std::lock_guard<std::mutex> lock(channel_mutex_);
+        retired_session_id_ = session_id_;
+        session_id_.clear();
+    }
+    remote_goodbye_.store(false);
+    awaiting_hello_.store(true);
     xEventGroupClearBits(event_group_handle_, MQTT_PROTOCOL_SERVER_HELLO_EVENT);
 
     auto message = GetHelloMessage();
@@ -291,6 +368,7 @@ bool MqttProtocol::OpenAudioChannel() {
     // 等待服务器响应
     EventBits_t bits = xEventGroupWaitBits(event_group_handle_, MQTT_PROTOCOL_SERVER_HELLO_EVENT,
                                            pdTRUE, pdFALSE, pdMS_TO_TICKS(10000));
+    awaiting_hello_.store(false);
     if (!(bits & MQTT_PROTOCOL_SERVER_HELLO_EVENT)) {
         ESP_LOGE(TAG, "Failed to receive server hello");
         SetError(Lang::Strings::SERVER_TIMEOUT);
@@ -299,7 +377,10 @@ bool MqttProtocol::OpenAudioChannel() {
 
     auto network = Board::GetInstance().GetNetwork();
     auto udp = network->CreateUdp(2);
-    udp->OnMessage([this](const std::string& data) {
+    udp->OnMessage([this, generation](const std::string& data) {
+        if (generation != channel_generation_.load() || IsChannelClosing()) {
+            return;
+        }
         /*
          * UDP Encrypted OPUS Packet Format:
          * |type 1u|flags 1u|payload_len 2u|ssrc 4u|timestamp 4u|sequence 4u|
@@ -349,6 +430,7 @@ bool MqttProtocol::OpenAudioChannel() {
         packet->sample_rate = server_sample_rate_;
         packet->frame_duration = server_frame_duration_;
         packet->timestamp = timestamp;
+        packet->channel_generation = generation;
         packet->payload.resize(decrypted_size);
         if (!CryptAesCtr(encrypted, decrypted_size, nonce,
                          reinterpret_cast<uint8_t*>(packet->payload.data()))) {
@@ -379,7 +461,7 @@ bool MqttProtocol::OpenAudioChannel() {
     }
 
     if (on_audio_channel_opened_ != nullptr) {
-        on_audio_channel_opened_();
+        on_audio_channel_opened_(generation);
     }
     return true;
 }
@@ -419,6 +501,7 @@ void MqttProtocol::ParseServerHello(const cJSON* root) {
 
     auto session_id = cJSON_GetObjectItem(root, "session_id");
     if (cJSON_IsString(session_id)) {
+        std::lock_guard<std::mutex> lock(channel_mutex_);
         session_id_ = session_id->valuestring;
         ESP_LOGI(TAG, "Session ID: %s", session_id_.c_str());
     }
@@ -564,6 +647,9 @@ bool MqttProtocol::DecodeHexString(const std::string& hex_string, std::string& d
 }
 
 bool MqttProtocol::IsAudioChannelOpened() const {
+    if (IsChannelClosing()) {
+        return false;
+    }
     std::lock_guard<std::mutex> lock(channel_mutex_);
     return udp_ != nullptr && !error_occurred_ && !IsTimeout();
 }

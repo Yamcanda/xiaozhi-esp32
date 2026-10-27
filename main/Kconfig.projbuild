@@ -941,6 +941,27 @@ choice DISPLAY_STYLE
             || BOARD_TYPE_ESP_SENSAIRSHUTTLE || BOARD_TYPE_STACKCHAN
 endchoice
 
+config STOPWATCH_LOCAL_APPS
+    bool "Stopwatch: Home, XiaoZhi, Alarms, Badge, Settings and Weather apps"
+    depends on BOARD_TYPE_M5STACK_STOPWATCH && SPIRAM
+    default n
+    help
+        Enable the board-local launcher, CST820 touch input, daily/date alarms
+        with voice setup and optional XiaoZhi reminders, six image badges, a
+        temporary LAN image editor, factory-style Settings and a three-page
+        Weather app with IP location, manual city selection, caching and voice
+        location tools. The default Open-Meteo endpoint is for non-commercial
+        use. XiaoZhi and Weather share the light/dark theme selector.
+        Use the m5stack-stopwatch-apps build variant with its dedicated badge
+        partition; the stock partition table has no writable badge storage.
+        Home, Alarms, Badge, Settings and Weather inhibit microphone uplink and
+        conversation continuation while retaining local wake-word detection.
+        A due alarm with a saved reminder may explicitly foreground XiaoZhi;
+        plain alarms ring locally without opening microphone capture.
+        A fresh wake word directly opens XiaoZhi for a new interaction; public
+        voice invocation cannot do so. An already-playing XiaoZhi reply may
+        finish, without resuming listening or reviving the previous conversation.
+
 config JC4827W543_EXTERNAL_AMP
     bool "JC4827W543: external I2S amplifier instead of the on-board NS4168"
     depends on BOARD_TYPE_GUITION_JC4827W543

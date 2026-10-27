@@ -10,6 +10,16 @@
                 "CONFIG_SPIRAM_MODE_OCT=y",
                 "CONFIG_SPIRAM_SPEED_80M=y"
             ]
+        },
+        {
+            "name": "m5stack-stopwatch-apps",
+            "sdkconfig_append": [
+                "CONFIG_SPIRAM=y",
+                "CONFIG_SPIRAM_MODE_OCT=y",
+                "CONFIG_SPIRAM_SPEED_80M=y",
+                "CONFIG_STOPWATCH_LOCAL_APPS=y",
+                "CONFIG_PARTITION_TABLE_CUSTOM_FILENAME=\"main/boards/m5stack/stopwatch/partitions_apps.csv\""
+            ]
         }
     ]
 }

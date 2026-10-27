@@ -14,7 +14,12 @@
 
 WebsocketProtocol::WebsocketProtocol() { event_group_handle_ = xEventGroupCreate(); }
 
-WebsocketProtocol::~WebsocketProtocol() { vEventGroupDelete(event_group_handle_); }
+WebsocketProtocol::~WebsocketProtocol() {
+    // Disconnect joins the receive callbacks while their owner/event group lives.
+    channel_callback_generation_->store(0);
+    websocket_.reset();
+    vEventGroupDelete(event_group_handle_);
+}
 
 bool WebsocketProtocol::Start() {
     // Only connect to server when audio channel is needed
@@ -22,7 +27,8 @@ bool WebsocketProtocol::Start() {
 }
 
 bool WebsocketProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
-    if (websocket_ == nullptr || !websocket_->IsConnected()) {
+    if (!packet || !IsAudioPacketCurrent(*packet) ||
+        websocket_ == nullptr || !websocket_->IsConnected()) {
         return false;
     }
 
@@ -37,7 +43,8 @@ bool WebsocketProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
         bp2->payload_size = htonl(packet->payload.size());
         memcpy(bp2->payload, packet->payload.data(), packet->payload.size());
 
-        return websocket_->Send(serialized.data(), serialized.size(), true);
+        return IsAudioPacketCurrent(*packet) &&
+               websocket_->Send(serialized.data(), serialized.size(), true);
     } else if (version_ == 3) {
         std::string serialized;
         serialized.resize(sizeof(BinaryProtocol3) + packet->payload.size());
@@ -47,14 +54,16 @@ bool WebsocketProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
         bp3->payload_size = htons(packet->payload.size());
         memcpy(bp3->payload, packet->payload.data(), packet->payload.size());
 
-        return websocket_->Send(serialized.data(), serialized.size(), true);
+        return IsAudioPacketCurrent(*packet) &&
+               websocket_->Send(serialized.data(), serialized.size(), true);
     } else {
-        return websocket_->Send(packet->payload.data(), packet->payload.size(), true);
+        return IsAudioPacketCurrent(*packet) &&
+               websocket_->Send(packet->payload.data(), packet->payload.size(), true);
     }
 }
 
 bool WebsocketProtocol::SendText(const std::string& text) {
-    if (websocket_ == nullptr || !websocket_->IsConnected()) {
+    if (IsChannelClosing() || websocket_ == nullptr || !websocket_->IsConnected()) {
         return false;
     }
 
@@ -68,15 +77,21 @@ bool WebsocketProtocol::SendText(const std::string& text) {
 }
 
 bool WebsocketProtocol::IsAudioChannelOpened() const {
-    return websocket_ != nullptr && websocket_->IsConnected() && !error_occurred_ && !IsTimeout();
+    return !IsChannelClosing() && websocket_ != nullptr && websocket_->IsConnected() && !error_occurred_ && !IsTimeout();
 }
 
 void WebsocketProtocol::CloseAudioChannel(bool send_goodbye) {
     (void)send_goodbye;  // Websocket doesn't need to send goodbye message
+    channel_callback_generation_->store(0);
     websocket_.reset();
 }
 
 bool WebsocketProtocol::OpenAudioChannel() {
+    if (IsChannelClosing()) {
+        return false;
+    }
+    const auto generation = BeginChannel();
+    xEventGroupClearBits(event_group_handle_, WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT);
     Settings settings("websocket", false);
     std::string url = settings.GetString("url");
     std::string token = settings.GetString("token");
@@ -105,36 +120,54 @@ bool WebsocketProtocol::OpenAudioChannel() {
     websocket_->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
     websocket_->SetHeader("Client-Id", Board::GetInstance().GetUuid().c_str());
 
-    websocket_->OnData([this](const char* data, size_t len, bool binary) {
+    websocket_->OnData([this, generation](const char* data, size_t len, bool binary) {
+        if (generation != channel_generation_.load() || IsChannelClosing()) {
+            return;
+        }
         if (binary) {
             if (on_incoming_audio_ != nullptr) {
                 if (version_ == 2) {
+                    if (len < sizeof(BinaryProtocol2)) {
+                        return;
+                    }
                     BinaryProtocol2* bp2 = (BinaryProtocol2*)data;
                     bp2->version = ntohs(bp2->version);
                     bp2->type = ntohs(bp2->type);
                     bp2->timestamp = ntohl(bp2->timestamp);
                     bp2->payload_size = ntohl(bp2->payload_size);
+                    if (bp2->payload_size > len - sizeof(BinaryProtocol2)) {
+                        return;
+                    }
                     auto payload = (uint8_t*)bp2->payload;
                     on_incoming_audio_(std::make_unique<AudioStreamPacket>(AudioStreamPacket{
                         .sample_rate = server_sample_rate_,
                         .frame_duration = server_frame_duration_,
                         .timestamp = bp2->timestamp,
+                        .channel_generation = generation,
                         .payload = std::vector<uint8_t>(payload, payload + bp2->payload_size)}));
                 } else if (version_ == 3) {
+                    if (len < sizeof(BinaryProtocol3)) {
+                        return;
+                    }
                     BinaryProtocol3* bp3 = (BinaryProtocol3*)data;
                     bp3->type = bp3->type;
                     bp3->payload_size = ntohs(bp3->payload_size);
+                    if (bp3->payload_size > len - sizeof(BinaryProtocol3)) {
+                        return;
+                    }
                     auto payload = (uint8_t*)bp3->payload;
                     on_incoming_audio_(std::make_unique<AudioStreamPacket>(AudioStreamPacket{
                         .sample_rate = server_sample_rate_,
                         .frame_duration = server_frame_duration_,
                         .timestamp = 0,
+                        .channel_generation = generation,
                         .payload = std::vector<uint8_t>(payload, payload + bp3->payload_size)}));
                 } else {
                     on_incoming_audio_(std::make_unique<AudioStreamPacket>(AudioStreamPacket{
                         .sample_rate = server_sample_rate_,
                         .frame_duration = server_frame_duration_,
                         .timestamp = 0,
+                        .channel_generation = generation,
                         .payload = std::vector<uint8_t>((uint8_t*)data, (uint8_t*)data + len)}));
                 }
             }
@@ -147,7 +180,7 @@ bool WebsocketProtocol::OpenAudioChannel() {
                     ParseServerHello(root);
                 } else {
                     if (on_incoming_json_ != nullptr) {
-                        on_incoming_json_(root);
+                        on_incoming_json_(root, generation);
                     }
                 }
             } else {
@@ -161,18 +194,26 @@ bool WebsocketProtocol::OpenAudioChannel() {
     // Callbacks run on the transport's receive task, which on 4G modems is the
     // AT event task and cannot send, so the Pong is sent from the main task.
     std::weak_ptr<WebSocket> weak_websocket = websocket_;
-    websocket_->OnPing([weak_websocket](const char* data, size_t len) {
-        Application::GetInstance().Schedule([weak_websocket, payload = std::string(data, len)]() {
-            if (auto websocket = weak_websocket.lock()) {
-                websocket->SendPong(payload.data(), payload.size());
-            }
-        });
+    auto callback_generation = channel_callback_generation_;
+    websocket_->OnPing([weak_websocket, callback_generation, generation](const char* data, size_t len) {
+        Application::GetInstance().Schedule(
+            [weak_websocket, callback_generation, generation, payload = std::string(data, len)]() {
+                // Main marks closing before launching teardown. Check before
+                // weak.lock(), so a queued Pong cannot become the final owner
+                // and move a blocking socket destructor onto the main task.
+                if (callback_generation->load() != generation) {
+                    return;
+                }
+                if (auto websocket = weak_websocket.lock()) {
+                    websocket->SendPong(payload.data(), payload.size());
+                }
+            });
     });
 
-    websocket_->OnDisconnected([this]() {
+    websocket_->OnDisconnected([this, generation]() {
         ESP_LOGI(TAG, "Websocket disconnected");
         if (on_audio_channel_closed_ != nullptr) {
-            on_audio_channel_closed_();
+            on_audio_channel_closed_(generation);
         }
     });
 
@@ -201,7 +242,7 @@ bool WebsocketProtocol::OpenAudioChannel() {
     }
 
     if (on_audio_channel_opened_ != nullptr) {
-        on_audio_channel_opened_();
+        on_audio_channel_opened_(generation);
     }
 
     return true;

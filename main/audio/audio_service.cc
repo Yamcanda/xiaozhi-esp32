@@ -84,8 +84,8 @@ void AudioService::Initialize(AudioCodec* codec) {
 #else
     audio_engine_ = std::make_unique<LiteAudioEngine>();
 #endif
-    audio_engine_->OnOutput([this](std::vector<int16_t>&& data) {
-        PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
+    audio_engine_->OnOutput([this](std::vector<int16_t>&& data, uint32_t policy) {
+        PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data), policy);
     });
     audio_engine_->OnVadStateChange([this](bool speaking) {
         voice_detected_ = speaking;
@@ -93,10 +93,15 @@ void AudioService::Initialize(AudioCodec* codec) {
             callbacks_.on_vad_change(speaking);
         }
     });
-    audio_engine_->OnWakeWordDetected([this](const std::string& wake_word) {
-        xEventGroupClearBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
+    audio_engine_->OnWakeWordDetected([this](const std::string& wake_word, uint32_t policy) {
+        auto running_policy = policy;
+        if ((policy & 1U) == 0 || policy != wake_word_policy_.load() ||
+            !wake_word_running_policy_.compare_exchange_strong(running_policy, policy & ~1U)) {
+            return;
+        }
+        UpdateWakeWordRunningState();
         if (callbacks_.on_wake_word_detected) {
-            callbacks_.on_wake_word_detected(wake_word);
+            callbacks_.on_wake_word_detected(wake_word, policy);
         }
     });
 
@@ -193,6 +198,9 @@ void AudioService::Stop() {
 }
 
 bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples) {
+#if CONFIG_USE_AUDIO_DEBUGGER
+    const auto policy = conversation_policy_.load();
+#endif
     if (!codec_->input_enabled()) {
         esp_timer_stop(audio_power_timer_);
         esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
@@ -229,11 +237,13 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
     debug_statistics_.input_count++;
 
 #if CONFIG_USE_AUDIO_DEBUGGER
-    // 音频调试：发送原始音频数据
-    if (audio_debugger_ == nullptr) {
-        audio_debugger_ = std::make_unique<AudioDebugger>();
+    // Local wake-only PCM must not be uploaded, even to the debug host.
+    if (IsConversationPolicyCurrent(policy)) {
+        if (audio_debugger_ == nullptr) {
+            audio_debugger_ = std::make_unique<AudioDebugger>();
+        }
+        audio_debugger_->Feed(data);
     }
-    audio_debugger_->Feed(data);
 #endif
 
     return true;
@@ -310,8 +320,17 @@ void AudioService::AudioInputTask() {
         if (bits & (AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING)) {
             int samples = 160;  // 10ms
             std::vector<int16_t> data;
-            if (ReadAudioData(data, 16000, samples)) {
-                audio_engine_->Feed(std::move(data));
+            const auto policy = conversation_policy_.load();
+            // Wake-only standby still needs local PCM, not voice output/uplink.
+            // Keep the disabled policy token so this cannot authorize a conversation.
+            if (((policy & 1U) != 0 || (bits & AS_EVENT_WAKE_WORD_RUNNING) != 0) &&
+                ReadAudioData(data, 16000, samples)) {
+                // The PCM token predates capture, not callback delivery. Do not
+                // relabel an in-flight microphone read after a foreground ABA.
+                if (policy != conversation_policy_.load()) {
+                    continue;
+                }
+                audio_engine_->Feed(std::move(data), policy);
                 continue;
             }
         }
@@ -473,7 +492,13 @@ void AudioService::OpusCodecTask() {
             packet->frame_duration = OPUS_FRAME_DURATION_MS;
             packet->sample_rate = 16000;
             packet->timestamp = task.timestamp;
+            packet->conversation_policy = task.conversation_policy;
 
+            if (task.type == kAudioTaskTypeEncodeToSendQueue &&
+                !IsConversationPolicyCurrent(task.conversation_policy)) {
+                lock.lock();
+                continue;
+            }
             if (opus_encoder_ != nullptr && task.pcm.size() == encoder_frame_size_) {
                 packet->payload.resize(encoder_outbuf_size_);
                 esp_audio_enc_in_frame_t in = {
@@ -492,12 +517,18 @@ void AudioService::OpusCodecTask() {
                     if (task.type == kAudioTaskTypeEncodeToSendQueue) {
                         {
                             std::lock_guard<std::mutex> lock2(audio_queue_mutex_);
-                            /* Never let a full send queue stall encoding: stale realtime
-                             * audio is useless to the server, so drop the oldest packet. */
-                            if (audio_send_queue_.size() >= MAX_SEND_PACKETS_IN_QUEUE) {
-                                audio_send_queue_.pop_front();
+                            if (!IsConversationPolicyCurrent(task.conversation_policy)) {
+                                // Encoding runs without the queue lock; an exit/reentry may
+                                // have invalidated this frame while the encoder was busy.
+                                packet.reset();
+                            } else {
+                                /* Never let a full send queue stall encoding: stale realtime
+                                 * audio is useless to the server, so drop the oldest packet. */
+                                if (audio_send_queue_.size() >= MAX_SEND_PACKETS_IN_QUEUE) {
+                                    audio_send_queue_.pop_front();
+                                }
+                                audio_send_queue_.push_back(std::move(packet));
                             }
-                            audio_send_queue_.push_back(std::move(packet));
                         }
                         if (callbacks_.on_send_queue_available) {
                             callbacks_.on_send_queue_available();
@@ -566,15 +597,23 @@ void AudioService::SetDecodeSampleRate(int sample_rate, int frame_duration) {
     }
 }
 
-void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm) {
+void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm,
+                                         uint32_t policy) {
+    if (type == kAudioTaskTypeEncodeToSendQueue && !IsConversationPolicyCurrent(policy)) {
+        return;
+    }
     AudioTask task;
     task.type = type;
     task.pcm = std::move(pcm);
+    task.conversation_policy = policy;
 
     uint32_t dropped_total = 0;
     {
         /* Push the task to the encode queue */
         std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+        if (type == kAudioTaskTypeEncodeToSendQueue && !IsConversationPolicyCurrent(policy)) {
+            return;
+        }
 
         /* If the task is to send queue, we need to set the timestamp */
         if (type == kAudioTaskTypeEncodeToSendQueue && !timestamp_queue_.empty()) {
@@ -619,7 +658,9 @@ bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> pa
             return false;
         }
     }
-    if (service_stopped_.load() || generation != playback_generation_) {
+    if ((packet->channel_generation != 0 &&
+         packet->channel_generation != reply_channel_generation_.load()) ||
+        service_stopped_.load() || generation != playback_generation_) {
         return false;
     }
     playback_drained_notified_ = false;
@@ -630,13 +671,15 @@ bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> pa
 
 std::unique_ptr<AudioStreamPacket> AudioService::PopPacketFromSendQueue() {
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
-    if (audio_send_queue_.empty()) {
-        return nullptr;
+    while (!audio_send_queue_.empty()) {
+        auto packet = std::move(audio_send_queue_.front());
+        audio_send_queue_.pop_front();
+        audio_queue_cv_.notify_all();
+        if (IsConversationPolicyCurrent(packet->conversation_policy)) {
+            return packet;
+        }
     }
-    auto packet = std::move(audio_send_queue_.front());
-    audio_send_queue_.pop_front();
-    audio_queue_cv_.notify_all();
-    return packet;
+    return nullptr;
 }
 
 void AudioService::EncodeWakeWord() {
@@ -662,7 +705,22 @@ std::unique_ptr<AudioStreamPacket> AudioService::PopWakeWordPacket() {
     return nullptr;
 }
 
-void AudioService::EnableWakeWordDetection(bool enable) {
+void AudioService::EnableWakeWordDetection(bool requested) {
+    wake_word_detection_requested_ = requested;
+    ApplyWakeWordDetection();
+}
+
+void AudioService::SetWakeWordDetectionInhibited(bool inhibited, uint32_t policy) {
+    wake_word_detection_inhibited_ = inhibited;
+    wake_word_policy_.store(policy);
+    // Replay intent, not IsWakeWordRunning(): detection itself may have stopped the engine.
+    ApplyWakeWordDetection();
+}
+
+void AudioService::ApplyWakeWordDetection() {
+    const bool enable = wake_word_detection_requested_ && !wake_word_detection_inhibited_;
+    // Invalidate a result before initialization/restore or any engine state transition.
+    wake_word_running_policy_.store(0);
     ESP_LOGD(TAG, "%s wake word detection", enable ? "Enabling" : "Disabling");
     if (enable) {
         if (!InitializeAudioEngine()) {
@@ -686,13 +744,31 @@ void AudioService::EnableWakeWordDetection(bool enable) {
                 esp_ae_rate_cvt_reset(input_resampler_);
             }
         }
-        audio_engine_->EnableWakeWordDetection(true);
-        xEventGroupSetBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
+        const auto policy = wake_word_policy_.load();
+        wake_word_running_policy_.store(policy);
+        audio_engine_->EnableWakeWordDetection(true, policy);
+        UpdateWakeWordRunningState();
     } else {
         if (audio_engine_initialized_) {
-            audio_engine_->EnableWakeWordDetection(false);
+            audio_engine_->EnableWakeWordDetection(false, wake_word_policy_.load());
         }
         xEventGroupClearBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
+    }
+}
+
+void AudioService::UpdateWakeWordRunningState() {
+    // A callback may finish publishing after re-enable. Event bits are only a mirror;
+    // replay the latest authoritative state if it changed during publication.
+    while (true) {
+        const auto policy = wake_word_running_policy_.load();
+        if (policy & 1U) {
+            xEventGroupSetBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
+        } else {
+            xEventGroupClearBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
+        }
+        if (policy == wake_word_running_policy_.load()) {
+            return;
+        }
     }
 }
 
@@ -710,7 +786,22 @@ void AudioService::ReleaseWakeWordResources() {
 #endif
 }
 
+void AudioService::ApplyConversationPolicy() {
+    // Main-task work only. Atomic invalidation has already fenced callbacks and
+    // encoder commits, including work that is currently outside the queue lock.
+    voice_processing_requested_ = false;
+    EnableVoiceProcessing(false);
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    audio_encode_queue_.clear();
+    audio_send_queue_.clear();
+    timestamp_queue_.clear();
+    audio_queue_cv_.notify_all();
+}
+
 void AudioService::EnableVoiceProcessing(bool enable) {
+    voice_processing_requested_ = enable;
+    const auto policy = conversation_policy_.load();
+    enable = enable && (policy & 1U);
     ESP_LOGD(TAG, "%s voice processing", enable ? "Enabling" : "Disabling");
 
     if (enable) {
@@ -725,11 +816,11 @@ void AudioService::EnableVoiceProcessing(bool enable) {
                 esp_ae_rate_cvt_reset(input_resampler_);
             }
         }
-        audio_engine_->EnableVoiceProcessing(true);
+        audio_engine_->EnableVoiceProcessing(true, policy);
         xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_PROCESSOR_RUNNING);
     } else {
         if (audio_engine_initialized_) {
-            audio_engine_->EnableVoiceProcessing(false);
+            audio_engine_->EnableVoiceProcessing(false, policy);
         }
         xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_PROCESSOR_RUNNING);
     }
@@ -880,6 +971,9 @@ bool AudioService::InitializeAudioEngine() {
         return false;
     }
     audio_engine_initialized_ = true;
+    // Initialization may have been deferred across foreground policy changes.
+    // Wake-only feeding must use the current epoch even before voice is started.
+    audio_engine_->EnableVoiceProcessing(false, conversation_policy_.load());
     audio_engine_->EnableDeviceAec(device_aec_enabled_);
     return true;
 }

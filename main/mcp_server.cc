@@ -8,6 +8,7 @@
 #include <esp_log.h>
 #include <esp_pthread.h>
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <iterator>
 #include <optional>
@@ -20,6 +21,20 @@
 #include "settings.h"
 
 #define TAG "MCP"
+
+namespace {
+template <size_t MaxLength>
+std::array<char, MaxLength + 1> LogPreview(const std::string& value) {
+    std::array<char, MaxLength + 1> preview{};
+    const size_t length = std::min(value.size(), MaxLength);
+    for (size_t i = 0; i < length; ++i) {
+        const auto byte = static_cast<unsigned char>(value[i]);
+        // Keep untrusted text on one bounded, terminal-safe ASCII log line.
+        preview[i] = byte >= 0x20 && byte <= 0x7e ? static_cast<char>(byte) : '?';
+    }
+    return preview;
+}
+}  // namespace
 
 McpServer::McpServer() {}
 
@@ -77,15 +92,19 @@ void McpServer::AddCommonTools() {
         AddTool("self.screen.set_theme",
                 "Set the theme of the screen. The theme can be `light` or `dark`.",
                 PropertyList({Property("theme", kPropertyTypeString)}),
-                [display](const PropertyList& properties) -> ReturnValue {
-                    auto theme_name = properties["theme"].value<std::string>();
+                [display](const PropertyList& properties) -> ToolResult {
+                    const auto& theme_name = properties["theme"].value<std::string>();
+                    ESP_LOGI(TAG, "Theme request: requested=%s bytes=%zu",
+                             LogPreview<64>(theme_name).data(), theme_name.size());
                     auto& theme_manager = LvglThemeManager::GetInstance();
                     auto theme = theme_manager.GetTheme(theme_name);
-                    if (theme != nullptr) {
-                        display->SetTheme(theme);
-                        return true;
+                    if (theme == nullptr) {
+                        return std::unexpected("Unknown theme. Use light or dark.");
                     }
-                    return false;
+                    display->SetTheme(theme);
+                    ESP_LOGI(TAG, "Theme setter returned: requested=%s",
+                             LogPreview<64>(theme_name).data());
+                    return true;
                 });
     }
 
@@ -585,12 +604,13 @@ void McpServer::GetToolsList(int id, const std::string& cursor, bool list_user_o
 
 void McpServer::DoToolCall(int id, const std::string& tool_name, const cJSON* tool_arguments,
                            ResponseSender response_sender) {
+    ESP_LOGI(TAG, "Tool call received: id=%d name=%s", id, LogPreview<96>(tool_name).data());
     auto tool_iter = std::find_if(tools_.begin(), tools_.end(), [&tool_name](const auto& tool) {
         return tool->name() == tool_name;
     });
 
     if (tool_iter == tools_.end()) {
-        ESP_LOGE(TAG, "tools/call: Unknown tool: %s", tool_name.c_str());
+        ESP_LOGE(TAG, "tools/call: Unknown tool: %s", LogPreview<96>(tool_name).data());
         ReplyError(id, -32602, "Unknown tool: " + tool_name, response_sender);
         return;
     }
@@ -637,12 +657,17 @@ void McpServer::DoToolCall(int id, const std::string& tool_name, const cJSON* to
     auto& app = Application::GetInstance();
     app.Schedule([this, id, tool, arguments = std::move(arguments),
                   response_sender = std::move(response_sender)]() {
+        ESP_LOGI(TAG, "Tool call executing: id=%d name=%s", id,
+                 LogPreview<96>(tool->name()).data());
         auto result = tool->Call(arguments);
         if (!result) {
-            ESP_LOGE(TAG, "tools/call: %s", result.error().c_str());
+            ESP_LOGE(TAG, "Tool call failed: id=%d name=%s error=%s", id,
+                     LogPreview<96>(tool->name()).data(), LogPreview<160>(result.error()).data());
             ReplyError(id, result.error(), response_sender);
             return;
         }
+        ESP_LOGI(TAG, "Tool call completed: id=%d name=%s", id,
+                 LogPreview<96>(tool->name()).data());
         ReplyResult(id, *result, response_sender);
     });
 }

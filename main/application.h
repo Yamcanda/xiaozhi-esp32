@@ -6,6 +6,7 @@
 #include <freertos/task.h>
 #include <esp_timer.h>
 
+#include <atomic>
 #include <string>
 #include <mutex>
 #include <deque>
@@ -101,6 +102,10 @@ public:
      * Sends MAIN_EVENT_START_LISTENING to be handled in Run()
      */
     void StartListening();
+    // Main task only. The optional nonblocking guard delays listen/start and
+    // microphone processing until local playback resources are safe to release.
+    // An empty handler preserves the existing listening behavior.
+    void SetListeningStartGuard(std::function<bool()> guard);
 
     /**
      * Stop listening (event-based, thread-safe)
@@ -109,6 +114,23 @@ public:
     void StopListening();
 
     void Reboot();
+    // Persistent wake-word policy, independent of the current conversation state.
+    // Safe under a display lock: invalidates wake requests immediately and schedules audio changes.
+    void SetWakeWordDetectionEnabled(bool enabled);
+    // Foreground availability: stop uplink immediately, allow only the current
+    // spoken reply to drain, and reopen into a fresh idle session.
+    void SetConversationEnabled(bool enabled);
+    static constexpr size_t kMaxTextInteractionBytes = Protocol::kMaxTextInteractionBytes;
+    // Main task only, without a display lock. The caller owns foreground UI and
+    // must enable conversation first. At most one request; no wake hook or PCM.
+    // True accepts local work, NOT server acceptance or audible playback.
+    // For accepted work, completion runs exactly once on main: true only after a
+    // matching TTS start; false on cancellation/failure or a 30-second deadline.
+    // A rejected request returns false without invoking completion.
+    bool RequestTextInteraction(const std::string& text, std::function<void(bool)> completion = {});
+    // Register during UI setup, before audio callbacks start. A real detector event
+    // uses this main-task hook to foreground voice or cancel pending UI navigation.
+    void SetWakeWordActivationHandler(std::function<bool()> handler);
     void WakeWordInvoke(const std::string& wake_word);
     bool UpgradeFirmware(const std::string& url, const std::string& version = "");
     bool CanEnterSleepMode();
@@ -132,7 +154,39 @@ private:
 
     std::mutex mutex_;
     std::deque<std::function<void()>> main_tasks_;
-    std::unique_ptr<Protocol> protocol_;
+    std::shared_ptr<Protocol> protocol_;
+    std::atomic<uint32_t> conversation_policy_{1};
+    std::atomic<uint32_t> conversation_ready_policy_{1};
+    uint32_t applied_conversation_policy_ = 1;
+    std::atomic<uint32_t> active_channel_generation_{0};
+    std::atomic<uint32_t> protocol_instance_{0};
+    std::atomic<uint32_t> draining_channel_generation_{0};
+    std::atomic<bool> reply_ended_{false};
+    std::atomic<bool> protocol_closing_{false};
+    std::atomic<bool> protocol_opening_{false};
+    bool protocol_open_close_pending_ = false;
+    uint32_t next_text_interaction_id_ = 0;
+    uint32_t text_interaction_id_ = 0;
+    uint32_t text_interaction_policy_ = 0;
+    uint32_t text_interaction_generation_ = 0;
+    uint32_t text_reply_generation_ = 0;
+    int64_t text_interaction_deadline_ = 0;
+    bool text_interaction_needs_close_ = false;
+    bool text_interaction_sent_ = false;
+    bool text_interaction_muted_ = false;
+    std::string pending_text_interaction_;
+    std::function<void(bool)> text_interaction_completion_;
+    static constexpr size_t kMaxDeferredMcpBytes = 16 * 1024;
+    std::deque<std::string> deferred_mcp_messages_;
+    size_t deferred_mcp_bytes_ = 0;
+    std::atomic<uint32_t> toggle_chat_policy_{0};
+    std::atomic<uint32_t> start_listening_policy_{0};
+    std::atomic<uint32_t> stop_listening_policy_{0};
+    uint32_t open_conversation_policy_ = 0;
+    std::atomic<bool> reset_protocol_pending_{false};
+    TaskHandle_t protocol_initialization_task_ = nullptr;
+    bool protocol_initialization_pending_ = false;
+    std::atomic<int64_t> reply_drain_deadline_{0};
     EventGroupHandle_t event_group_ = nullptr;
     esp_timer_handle_t clock_timer_handle_ = nullptr;
     esp_timer_handle_t startup_wake_word_hint_timer_ = nullptr;
@@ -142,6 +196,13 @@ private:
     std::string last_error_message_;
     std::string startup_wake_word_hint_message_;
     AudioService audio_service_;
+    // Bit 0 is the policy (enabled by default); upper bits invalidate earlier wake work.
+    std::atomic<uint32_t> wake_word_policy_{1};
+    std::atomic<uint32_t> wake_word_event_policy_{0};
+    std::atomic<uint32_t> wake_word_invocation_policy_{0};  // Pending wake-owned connection.
+    std::function<bool()> wake_word_activation_handler_;
+    std::string pending_wake_word_;
+    uint32_t pending_wake_policy_ = 0;
     NotifyPlayer notify_player_;
     uint32_t notification_playback_id_ = 0;
     std::unique_ptr<Ota> ota_;
@@ -154,7 +215,9 @@ private:
     bool aborted_ = false;
     bool assets_version_checked_ = false;
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
-    bool pending_listening_start_ = false;  // Waiting for playback to drain before starting listening (auto mode)
+    bool pending_listening_start_ =
+        false;  // Waiting for auto playback drain or the listening guard.
+    std::function<bool()> listening_start_guard_;
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
 
@@ -168,10 +231,44 @@ private:
     void HandleNetworkDisconnectedEvent();
     void HandleActivationDoneEvent();
     void HandleWakeWordDetectedEvent();
-    void ContinueOpenAudioChannel(ListeningMode mode);
-    void BeginWakeWordInvoke(const std::string& wake_word);
-    void ContinueWakeWordInvoke(const std::string& wake_word);
+    bool IsConversationCurrent(uint32_t policy) const;
+    bool IsConversationAvailable() const;
+    bool IsChannelCurrent(uint32_t generation) const;
+    bool CanReceiveReply(uint32_t generation) const;
+    void ApplyConversationPolicy(uint32_t policy);
+    void FinishConversationDrain();
+    void CloseConversationChannel();
+    void CloseAudioChannel();
+    struct ConversationCloseJob {
+        Application* app;
+        std::shared_ptr<Protocol> protocol;
+    };
+    void ReleaseConversationClose(ConversationCloseJob* job);
+    void CompleteConversationClose();
+    void ResumeProtocolInitialization();
+    struct TextInteractionOpenJob {
+        Application* app;
+        std::shared_ptr<Protocol> protocol;
+        uint32_t request;
+        uint32_t policy;
+        uint32_t instance;
+    };
+    void ResumeTextInteraction();
+    void CompleteTextInteractionOpen(uint32_t request, uint32_t policy, uint32_t instance,
+                                     Protocol* protocol, bool opened);
+
+    void FinishTextInteraction(bool started);
+    void FlushDeferredMcpMessages();
+    void PublishAudioChannelOpened(uint32_t generation);
+    void ContinueOpenAudioChannel(ListeningMode mode, uint32_t policy);
+    bool IsWakeWordDetectionCurrent(uint32_t policy) const;
+    bool IsWakeWordInvocationCurrent(uint32_t policy) const;
+    void ResumeWakeWordActivation();
+    void CancelWakeWordInvoke(uint32_t policy);
+    void BeginWakeWordInvoke(const std::string& wake_word, uint32_t policy);
+    void ContinueWakeWordInvoke(const std::string& wake_word, uint32_t policy);
     void StartListeningAudio();
+    void ResumeListeningAudio();
     void ConfigureWakeWordForListening();
     void ShowStartupWakeWordHint();
     void HideStartupWakeWordHint();
@@ -185,7 +282,7 @@ private:
     // Helper methods
     void CheckAssetsVersion();
     void CheckNewVersion();
-    void InitializeProtocol();
+    bool InitializeProtocol();
     void ShowActivationCode(const std::string& code, const std::string& message);
     void SetListeningMode(ListeningMode mode);
     ListeningMode GetDefaultListeningMode() const;

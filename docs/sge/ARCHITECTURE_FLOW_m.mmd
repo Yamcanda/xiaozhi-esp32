@@ -1,0 +1,96 @@
+flowchart TB
+  subgraph System["系统启动"]
+    A["bootloader -> app_main()"] --> B["初始化NVS"]
+    B --> C["Application::GetInstance()"]
+  end
+
+  subgraph App["Application (核心)"]
+    C --> D["Application::Initialize()"]
+    D --> D1["SetDeviceState(kDeviceStateStarting)"]
+    D --> D2["Init Display -> Show SystemInfo"]
+    D --> D3["Init AudioService -> Start"]
+    D --> D4["Register Audio Callbacks"]
+    D --> D5["Start Clock Timer (1s)"]
+    D --> D6["MCP: AddCommonTools / AddUserOnlyTools"]
+    D --> D7["Board.StartNetwork()"]
+    D --> E["Application::Run() 主事件循环"]
+  end
+
+  subgraph Board["Board / 硬件抽象"]
+    B1[Display]
+    B2[AudioCodec]
+    B3[Network]
+    B4[Backlight]
+    B5[Camera]
+  end
+
+  subgraph Protocol["协议层"]
+    P1["InitializeProtocol()"]
+    P2["Protocol impl (MQTT / WebSocket)"]
+    P3["OpenAudioChannel / SendAudio / ReceiveAudio"]
+  end
+
+  subgraph MCP["MCP 服务"]
+    M1["注册工具: self.get_device_status ... self.upgrade_firmware"]
+    M2["工具回调 -> 操作 Board / 调度 Application"]
+  end
+
+  subgraph OTA["OTA 管理"]
+    O1["Ota::CheckVersion()"]
+    O2["下载固件并安装(需人工/策略审计)"]
+  end
+
+  %% 连接
+  E -->|网络事件| P1
+  P1 --> P2
+  P2 --> P3
+
+  P2 -->|OnIncomingJson| E
+  P2 -->|OnIncomingAudio| App
+  App -->|请求升级| O1
+  O1 --> O2
+
+  App -->|调用| MCP
+  MCP -->|调用工具回调| Board
+  Board -->|状态回调| App
+
+  %% 事件细节
+  subgraph Events["主事件位 & 处理"]
+    Ev1[MAIN_EVENT_NETWORK_CONNECTED]
+    Ev2[MAIN_EVENT_SEND_AUDIO]
+    Ev3[MAIN_EVENT_WAKE_WORD_DETECTED]
+    Ev4[MAIN_EVENT_TOGGLE_CHAT]
+    Ev5[MAIN_EVENT_STATE_CHANGED]
+  end
+
+  E --> Ev1
+  E --> Ev2
+  E --> Ev3
+  E --> Ev4
+  E --> Ev5
+
+  Ev1 -->|触发| P1
+  Ev2 -->|发送队列| P3
+  Ev3 -->|唤醒词| App
+
+  %% 安全/审计注记
+  classDef warn fill:#ffdddd,stroke:#ff0000,color:#990000
+
+  subgraph Security["安全与审计"]
+    S1["敏感信息扫描 (sdkconfig, config.env, URL/凭证)"]
+    S2["写操作需生成补丁并人工审批"]
+    S3["OTA / reboot / upload 禁止自动执行"]
+  end
+
+  class S1,S2,S3 warn
+
+  O2 --> S2
+  MCP --> S2
+  P2 --> S1
+
+  %% 文件链接（快速导航）
+  click C "main/main.cc#L1" "入口: main/main.cc"
+  click D "main/application.cc#L1" "Application::Initialize/Run"
+  click M1 "main/mcp_server.cc#L1" "MCP 实现"
+  click O1 "main/ota.cc#L1" "OTA 检查实现"
+  click P2 "main/protocols/protocol.h#L1" "Protocol 抽象"

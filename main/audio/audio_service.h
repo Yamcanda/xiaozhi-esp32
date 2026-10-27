@@ -81,7 +81,7 @@
 
 struct AudioServiceCallbacks {
     std::function<void(void)> on_send_queue_available;
-    std::function<void(const std::string&)> on_wake_word_detected;
+    std::function<void(const std::string&, uint32_t policy)> on_wake_word_detected;
     std::function<void(bool)> on_vad_change;
     std::function<void(void)> on_audio_testing_queue_full;
     // Fired when the decode/playback queues and their in-flight work are drained.
@@ -100,6 +100,7 @@ struct AudioTask {
     std::vector<int16_t> pcm;
     uint32_t timestamp = 0;
     uint32_t playback_id = 0;
+    uint32_t conversation_policy = 1;
     uint32_t media_position_ms = 0;
 };
 
@@ -134,8 +135,18 @@ public:
     }
     bool IsAfeWakeWord();
 
-    void EnableWakeWordDetection(bool enable);
+    // Preserve the application's latest runtime request even while policy inhibits detection.
+    void EnableWakeWordDetection(bool requested);
+    void SetWakeWordDetectionInhibited(bool inhibited, uint32_t policy = 1);
     void ReleaseWakeWordResources();
+    // Atomic-only invalidation, safe while the caller holds a display lock.
+    void SetConversationPolicy(uint32_t policy) {
+        conversation_policy_.store(policy);
+        wake_word_running_policy_.store(0);
+        xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_PROCESSOR_RUNNING | AS_EVENT_WAKE_WORD_RUNNING);
+    }
+    void SetReplyChannel(uint32_t generation) { reply_channel_generation_.store(generation); }
+    void ApplyConversationPolicy();
     void EnableVoiceProcessing(bool enable);
     void EnableAudioTesting(bool enable);
     void EnableDeviceAec(bool enable);
@@ -199,6 +210,13 @@ private:
     FixedQueue<uint32_t, MAX_TIMESTAMPS_IN_QUEUE> timestamp_queue_;
 
     bool audio_engine_initialized_ = false;
+    bool wake_word_detection_requested_ = false;
+    bool wake_word_detection_inhibited_ = false;
+    std::atomic<uint32_t> wake_word_policy_{1};
+    std::atomic<uint32_t> wake_word_running_policy_{0};  // Odd only while armed for this policy.
+    std::atomic<uint32_t> conversation_policy_{1};
+    std::atomic<uint32_t> reply_channel_generation_{0};
+    bool voice_processing_requested_ = false;
     bool voice_detected_ = false;
 #if CONFIG_USE_DEVICE_AEC
     bool device_aec_enabled_ = true;
@@ -215,8 +233,14 @@ private:
     void AudioInputTask();
     void AudioOutputTask();
     void OpusCodecTask();
-    void PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm);
+    void PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm,
+                               uint32_t policy = 1);
+    bool IsConversationPolicyCurrent(uint32_t policy) const {
+        return (policy & 1U) != 0 && policy == conversation_policy_.load();
+    }
     bool InitializeAudioEngine();
+    void ApplyWakeWordDetection();
+    void UpdateWakeWordRunningState();
     void SetDecodeSampleRate(int sample_rate, int frame_duration);
     void CheckAndUpdateAudioPowerState();
     bool IsPlaybackDrainedLocked() const;
